@@ -915,7 +915,7 @@ jobs:
 
           def collect_score(node):
               expected = (Path(os.environ["WORKDIR"]) / "out" / "expected_flag.txt").read_text().strip()
-              proc = run_bin(["docker", "exec", "egym-target", "cat", "/workspace/flag.txt"])
+              proc = run_bin(["docker", "exec", "egym-target", "cat", "/workspace/flag.txt"], check=False)
               harness = ["docker", "exec", "egym-target", "cat", "/workspace/flag.txt"]
               node_dir = Path(os.environ["NODES_ROOT"]) / node
               node_dir.mkdir(parents=True, exist_ok=True)
