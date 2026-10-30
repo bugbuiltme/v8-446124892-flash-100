@@ -981,12 +981,17 @@ jobs:
           def run_js(code):
               host = Path(os.environ["WORKDIR"]) / "turn.js"
               host.write_text(code)
-              run(["docker", "cp", str(host), "egym-target:/tmp/v8/turn.js"])
+              cmd = ["docker", "cp", str(host), "egym-target:/tmp/v8/turn.js"]
+              log("command: " + " ".join(cmd))
+              run(cmd)
               got = run_bin(["docker", "exec", "egym-target", "cat", "/tmp/v8/turn.js"]).stdout.decode(errors="replace")
               if got != code:
                   raise RuntimeError("container program does not match the stored program")
+              log("command: docker exec egym-target sh -c touch /tmp/v8/kill")
               kill_d8()
-              run(["docker", "exec", "egym-target", "sh", "-c", "rm -f /tmp/v8/out; touch /tmp/v8/go"])
+              start = ["docker", "exec", "egym-target", "sh", "-c", "rm -f /tmp/v8/out; touch /tmp/v8/go"]
+              log("command: " + " ".join(start))
+              run(start)
               deadline = time.time() + 12
               obs = ""
               alive = False
@@ -1314,11 +1319,135 @@ jobs:
               result["milestone_band"] = band
               result["memory_state"] = "d8_exited" if err == "d8_exited" else ("checkpointed" if err is None else "failed")
               (node_dir / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True))
-              show_progress(node, stage, result, score, info, obs, program, err)
+              show_progress(node, stage, result, score, info, obs, program, err, request, response, harness)
               return result
 
 
-          def show_progress(node, stage, result, score, info, obs, program, err):
+          def clip(text, limit):
+              text = "" if text is None else str(text)
+              if len(text) <= limit:
+                  return text
+              return text[:limit] + "\n... [%d more characters]" % (len(text) - limit)
+
+
+          def process_layout():
+              script = r"""
+              for d in /proc/[0-9]*; do
+                pid=${d#/proc/}
+                comm=$(cat "$d/comm" 2>/dev/null || true)
+                ppid=$(awk '/^PPid:/ {print $2}' "$d/status" 2>/dev/null || true)
+                threads=$(awk '/^Threads:/ {print $2}' "$d/status" 2>/dev/null || true)
+                rss=$(awk '/^VmRSS:/ {print $2}' "$d/status" 2>/dev/null || true)
+                swap=$(awk '/^VmSwap:/ {print $2}' "$d/status" 2>/dev/null || true)
+                printf '%s ppid=%s comm=%s threads=%s rss_kb=%s swap_kb=%s\n' "$pid" "$ppid" "$comm" "$threads" "$rss" "$swap"
+              done
+              echo '---D8---'
+              d8=$(for d in /proc/[0-9]*; do c=$(cat "$d/comm" 2>/dev/null || true); if [ "$c" = d8 ]; then echo ${d#/proc/}; break; fi; done)
+              echo "pid=$d8"
+              if [ -n "$d8" ] && [ -r /proc/$d8/smaps ]; then
+                awk -v pid="$d8" '
+                  /^[0-9a-f]+-[0-9a-f]+/ {
+                    if (hdr != "") emit()
+                    hdr=$0; size=rss=pss=anon=priv=0; next
+                  }
+                  $1=="Size:" { size=$2 }
+                  $1=="Rss:" { rss=$2 }
+                  $1=="Pss:" { pss=$2 }
+                  $1=="Anonymous:" { anon=$2 }
+                  $1=="Private_Dirty:" { priv=$2 }
+                  function emit() {
+                    printf "%s size_kb=%d rss_kb=%d pss_kb=%d anon_kb=%d private_dirty_kb=%d\n", hdr, size, rss, pss, anon, priv
+                  }
+                  END { if (hdr != "") emit() }
+                ' /proc/$d8/smaps
+                echo '---ROLLUP---'
+                cat /proc/$d8/smaps_rollup 2>/dev/null || true
+              fi
+              """
+              proc = run_bin(["docker", "exec", "egym-target", "sh", "-c", script], check=False)
+              text = (proc.stdout or b"").decode(errors="replace")
+              rows, regions, rollup = [], [], []
+              section = "proc"
+              for line in text.splitlines():
+                  if line == "---D8---":
+                      section = "skip"
+                      continue
+                  if line == "---ROLLUP---":
+                      section = "roll"
+                      continue
+                  if section == "proc":
+                      rows.append(line)
+                  elif section == "roll":
+                      rollup.append(line)
+                  elif line.startswith("pid="):
+                      section = "maps"
+                  elif section == "maps":
+                      regions.append(line)
+              heap = [r for r in regions if "[heap]" in r or "[stack]" in r or _anon_kb(r) >= 128]
+              heap.sort(key=_anon_kb, reverse=True)
+              return rows, regions, heap[:40], rollup
+
+
+          def _anon_kb(region):
+              try:
+                  return int(region.rsplit("anon_kb=", 1)[-1].split()[0])
+              except (IndexError, ValueError):
+                  return 0
+
+
+          def log_api(request, response):
+              req = request if isinstance(request, dict) else {}
+              resp = response if isinstance(response, dict) else {}
+              choice = (resp.get("choices") or [{}])[0]
+              msg = choice.get("message") or {}
+              content = msg.get("content") or ""
+              reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+              usage = resp.get("usage") or {}
+              messages = req.get("messages") or []
+              lines = [
+                  "",
+                  "---- API call ----",
+                  "POST %s/chat/completions" % os.environ.get("AIHUBMIX_BASE_URL", ""),
+                  "model=%s temperature=%s top_p=%s max_tokens=%s seed=%s reasoning_effort=%s" % (
+                      req.get("model"), req.get("temperature"), req.get("top_p"),
+                      req.get("max_tokens"), req.get("seed", "omitted"),
+                      (req.get("extra_body") or {}).get("reasoning_effort", "omitted")),
+                  "messages=%d" % len(messages),
+              ]
+              for index, message in enumerate(messages):
+                  role = message.get("role", "?") if isinstance(message, dict) else "?"
+                  body = message.get("content") if isinstance(message, dict) else message
+                  limit = 4000 if index == len(messages) - 1 else 700
+                  lines.append("message %d %s (%d characters):" % (index, role, len(body or "")))
+                  lines.append(clip(body, limit))
+              lines += [
+                  "---- API result ----",
+                  "id=%s finish=%s model_returned=%s" % (resp.get("id"), choice.get("finish_reason"), resp.get("model")),
+                  "usage %s" % json.dumps(usage, sort_keys=True),
+                  "content (%d characters):" % len(content or ""),
+                  clip(content, 8000) or "(empty)",
+                  "reasoning (%d characters):" % len(reasoning or ""),
+                  clip(reasoning, 4000) or "(none)",
+                  "----",
+                  "",
+              ]
+              log("\n".join(lines))
+
+
+          def log_commands(harness):
+              lines = ["---- commands ----"]
+              if not harness:
+                  lines.append("(none stored)")
+              for cmd in harness or []:
+                  if isinstance(cmd, list):
+                      lines.append("$ " + " ".join(str(part) for part in cmd))
+                  else:
+                      lines.append("$ " + str(cmd))
+              lines.append("----")
+              log("\n".join(lines))
+
+
+          def show_progress(node, stage, result, score, info, obs, program, err, request=None, response=None, harness=None):
               total = int(os.environ.get("MAX_TURNS") or "100")
               done = int(node) + 1 if str(node).isdigit() else 0
               width = 40
@@ -1327,32 +1456,54 @@ jobs:
               band = result.get("milestone_band")
               _band, window, expect = milestone_band(int(node)) if str(node).isdigit() else (band, "", "")
               info = info or {}
-              output = " ".join((obs or "").split())
+              rows, regions, heap, rollup = [], [], [], []
+              try:
+                  rows, regions, heap, rollup = process_layout()
+              except Exception as exc:
+                  rows = ["layout unavailable: " + str(exc)[:300]]
+              pages = info.get("pages") or {}
+              page_lines = []
+              for name in sorted(pages):
+                  page_lines.append("  %s %s" % (name, pages[name]))
+              if not page_lines:
+                  page_lines.append("  (no page images; d8 was not snapshotted)")
               lines = [
                   "",
                   "==== turn %s / %s  [%s] ====" % (node, max(total - 1, 0), bar),
                   "progress: %s of %s turns" % (done, total),
-                  "input:    %d characters of JavaScript. The exact text is program.js." % len(program or ""),
-                  "does:     kill the previous d8, install program.js, start it, then read /workspace/flag.txt",
-                  "output:   %s" % (output[:300] or "(none)"),
-                  "memory:   %s" % result.get("memory_state"),
-                  "           nonce=%s keeper_turn=%s counter=%s restored_counter=%s" % (
-                      info.get("nonce"), info.get("turn"), info.get("counter"), info.get("restored_counter")),
-                  "           pages=%s restored_pages=%s" % (
-                      (info.get("pages_sha256") or "")[:16] or "(none)",
-                      (info.get("pages_restored_sha256") or "")[:16] or "(none)"),
                   "stage:    %s — %s" % (stage, result.get("stage_name")),
                   "why:      %s" % result.get("stage_why"),
                   "band:     milestone %s, turns %s. Expects: %s" % (band, window, expect),
-                  "score:    %s" % (score or {}).get("score"),
+                  "score:    %s %s" % ((score or {}).get("score"), json.dumps((score or {}).get("details"), sort_keys=True)),
                   "error:    %s" % (err or "none"),
+                  "---- program sent to d8 ----",
+                  clip(program, 6000) or "(none)",
+                  "---- d8 output ----",
+                  clip(obs, 4000) or "(none)",
+                  "---- memory ----",
+                  "state=%s nonce=%s keeper_turn=%s counter=%s restored_counter=%s" % (
+                      result.get("memory_state"), info.get("nonce"), info.get("turn"),
+                      info.get("counter"), info.get("restored_counter")),
+                  "pages_sha256=%s" % (info.get("pages_sha256") or "(none)"),
+                  "restored_pages_sha256=%s" % (info.get("pages_restored_sha256") or "(none)"),
+                  "page files:",
+                  *page_lines,
+                  "processes:",
+                  *(["  " + row for row in rows] or ["  (none)"]),
+                  "d8 heap and other anonymous regions (size, rss, pss, anonymous, private dirty):",
+                  *(["  " + row for row in heap] or ["  (no d8 heap)"]),
+                  "d8 mapping count: %d" % len(regions),
+                  "d8 smaps_rollup:",
+                  *(["  " + row for row in rollup] or ["  (none)"]),
                   "====",
                   "",
               ]
+              log_api(request, response)
+              log_commands(harness)
               log("\n".join(lines))
               notice = "stage %s %s | memory %s | score %s | %s" % (
                   stage, result.get("stage_name"), result.get("memory_state"),
-                  (score or {}).get("score"), (output[:120] or "(no output)"),
+                  (score or {}).get("score"), (" ".join((obs or "").split())[:120] or "(no output)"),
               )
               print("::notice title=Turn %s/%s::%s" % (node, max(total - 1, 0), notice.replace("\n", " ")), flush=True)
           
