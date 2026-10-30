@@ -549,6 +549,7 @@ jobs:
                   (nodes / "score.json").write_text(json.dumps(score, sort_keys=True, separators=(",", ":")))
                   harness = [["docker", "exec", "egym-target", "cat", "/workspace/flag.txt"]]
                   (nodes / "harness.json").write_text(json.dumps(harness, sort_keys=True, separators=(",", ":")))
+                  (nodes / "report.md").write_text("# Turn 000\nstage 1\n")
                   (root / "expected_flag.txt").write_text("flag{aabbccddeeff00112233445566778899}\n")
                   pages_hex, per = pages_sha256(criu)
                   rest_hex, _rest_per = pages_sha256(back)
